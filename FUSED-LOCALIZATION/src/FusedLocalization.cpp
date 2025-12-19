@@ -27,7 +27,9 @@ FusedLocalization::FusedLocalization()
       last_reloc_time_(0.0),
       keyframe_count_(0),
       last_gps_time_(0.0),
-      init_start_time_(0.0)
+      init_start_time_(0.0),
+      have_last_image_(false),
+      last_image_ts_(0.0)
 {
     // 初始化点云
     prior_map_.reset(new pcl::PointCloud<pcl::PointXYZI>());
@@ -145,6 +147,13 @@ void FusedLocalization::loadParameters() {
     declare_parameter("teaser_enable", false);
     declare_parameter("teaser_max_corr_dist", 2.0);
     declare_parameter("teaser_noise_bound", 0.05);
+    declare_parameter("image_enable", true);
+    declare_parameter("image_weight", 0.3);
+    declare_parameter("image_fx", 500.0);
+    declare_parameter("image_fy", 500.0);
+    declare_parameter("image_cx", 320.0);
+    declare_parameter("image_cy", 240.0);
+    declare_parameter("image_min_matches", 50);
     
     get_parameter("output_frequency", output_frequency_);
     get_parameter("prior_map_path", prior_map_path_);
@@ -176,6 +185,13 @@ void FusedLocalization::loadParameters() {
     get_parameter("teaser_enable", teaser_enable_);
     get_parameter("teaser_max_corr_dist", teaser_max_corr_dist_);
     get_parameter("teaser_noise_bound", teaser_noise_bound_);
+    get_parameter("image_enable", image_enable_);
+    get_parameter("image_weight", image_weight_);
+    get_parameter("image_fx", image_fx_);
+    get_parameter("image_fy", image_fy_);
+    get_parameter("image_cx", image_cx_);
+    get_parameter("image_cy", image_cy_);
+    get_parameter("image_min_matches", image_min_matches_);
     
     voxel_filter_.setLeafSize(voxel_leaf_size_, voxel_leaf_size_, voxel_leaf_size_);
     
@@ -559,6 +575,20 @@ void FusedLocalization::processFrontend() {
 
     current_state_ = transformToState(last_transform_, 
                                      rclcpp::Time(lidar_buffer_.back()->header.stamp).seconds());
+
+    // 图像辅助融合（只融合姿态，平移保持里程计）
+    if (image_enable_) {
+        VisualResult vr;
+        if (processImageAssist(vr) && vr.success) {
+            Eigen::Quaterniond q_odom(last_transform_.block<3,3>(0,0));
+            Eigen::Quaterniond q_vis = q_odom * vr.rot;
+            double w = std::min(1.0, std::max(0.0, image_weight_));
+            Eigen::Quaterniond q_fused = q_odom.slerp(w, q_vis);
+            q_fused.normalize();
+            last_transform_.block<3,3>(0,0) = q_fused.toRotationMatrix();
+            current_state_.orientation = q_fused;
+        }
+    }
     
     *last_cloud_ = *current_cloud_;
 }
@@ -976,11 +1006,55 @@ std::vector<CandidatePose> FusedLocalization::generateScanContextCandidates() {
     std::vector<CandidatePose> out;
     if (!scan_context_enable_) return out;
     try {
-        // 占位：若未接入真实 Scan Context，可保持空；接入后将描述子检索得到的初值放入 out
-        RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 5000,
-                             "Scan Context not implemented; returning empty candidates.");
+        if (prior_map_->empty() || current_cloud_->empty()) return out;
+
+        // 下采样
+        pcl::PointCloud<pcl::PointXYZI>::Ptr src(new pcl::PointCloud<pcl::PointXYZI>(*current_cloud_));
+        pcl::PointCloud<pcl::PointXYZI>::Ptr tgt(new pcl::PointCloud<pcl::PointXYZI>(*prior_map_));
+        pcl::VoxelGrid<pcl::PointXYZI> vg;
+        vg.setLeafSize(voxel_leaf_size_, voxel_leaf_size_, voxel_leaf_size_);
+        vg.setInputCloud(src); vg.filter(*src);
+        vg.setInputCloud(tgt); vg.filter(*tgt);
+        if (src->size() < 50 || tgt->size() < 200) return out;
+
+        // 法线估计
+        pcl::PointCloud<pcl::Normal>::Ptr n_src(new pcl::PointCloud<pcl::Normal>());
+        pcl::PointCloud<pcl::Normal>::Ptr n_tgt(new pcl::PointCloud<pcl::Normal>());
+        pcl::NormalEstimationOMP<pcl::PointXYZI, pcl::Normal> ne;
+        ne.setKSearch(20);
+        ne.setInputCloud(src); ne.compute(*n_src);
+        ne.setInputCloud(tgt); ne.compute(*n_tgt);
+
+        // FPFH 特征
+        pcl::PointCloud<pcl::FPFHSignature33>::Ptr f_src(new pcl::PointCloud<pcl::FPFHSignature33>());
+        pcl::PointCloud<pcl::FPFHSignature33>::Ptr f_tgt(new pcl::PointCloud<pcl::FPFHSignature33>());
+        pcl::FPFHEstimationOMP<pcl::PointXYZI, pcl::Normal, pcl::FPFHSignature33> fpfh;
+        fpfh.setRadiusSearch(0.5);
+        fpfh.setInputCloud(src); fpfh.setInputNormals(n_src); fpfh.compute(*f_src);
+        fpfh.setInputCloud(tgt); fpfh.setInputNormals(n_tgt); fpfh.compute(*f_tgt);
+
+        // SAC-IA 粗配准
+        pcl::SampleConsensusInitialAlignment<pcl::PointXYZI, pcl::PointXYZI, pcl::FPFHSignature33> sac_ia;
+        sac_ia.setMinSampleDistance(0.5);
+        sac_ia.setMaxCorrespondenceDistance(2.0);
+        sac_ia.setMaximumIterations(200);
+        sac_ia.setInputSource(src);
+        sac_ia.setSourceFeatures(f_src);
+        sac_ia.setInputTarget(tgt);
+        sac_ia.setTargetFeatures(f_tgt);
+        pcl::PointCloud<pcl::PointXYZI> sac_aligned;
+        sac_ia.align(sac_aligned);
+
+        if (sac_ia.hasConverged()) {
+            CandidatePose cp;
+            cp.transform = sac_ia.getFinalTransformation().cast<double>();
+            cp.score = sac_ia.getFitnessScore();
+            cp.source = "SC_SACIA";
+            cp.valid = true;
+            out.push_back(cp);
+        }
     } catch (const std::exception& e) {
-        RCLCPP_ERROR(get_logger(), "Scan Context candidate generation failed: %s", e.what());
+        RCLCPP_ERROR(get_logger(), "Scan Context (FPFH+SAC-IA) failed: %s", e.what());
     }
     return out;
 }
@@ -1031,13 +1105,178 @@ bool FusedLocalization::registerWithTeaser(const pcl::PointCloud<pcl::PointXYZI>
                                            Eigen::Matrix4d& T) {
     if (!teaser_enable_) return false;
     try {
-        // 占位：未接入 TEASER++ 时返回 false，避免编译依赖。
+        #ifdef WITH_TEASERPP
+        using namespace teaser;
+        if (!src || !tgt || src->size() < 30 || tgt->size() < 30) return false;
+        std::vector<Eigen::Vector3d> src_pts, tgt_pts;
+        src_pts.reserve(src->size());
+        tgt_pts.reserve(tgt->size());
+        for (auto& p : src->points) src_pts.emplace_back(p.x, p.y, p.z);
+        for (auto& p : tgt->points) tgt_pts.emplace_back(p.x, p.y, p.z);
+
+        RobustRegistrationSolver::Params params;
+        params.noise_bound = teaser_noise_bound_;
+        params.cbar2 = 1.0;
+        params.estimate_scaling = false;
+        params.rotation_tim_graph = RobustRegistrationSolver::Params::ROTATION_TIM_GRAPH::CHAIN;
+        RobustRegistrationSolver solver(params);
+        solver.solve(src_pts, tgt_pts);
+        auto sol = solver.getSolution();
+        if (!sol.valid) return false;
+        T.setIdentity();
+        T.block<3,3>(0,0) = sol.rotation;
+        T.block<3,1>(0,3) = sol.translation;
+        return true;
+        #else
         RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 5000,
-                             "TEASER++ not implemented; returning false.");
+                             "TEASER++ not enabled (compile with -DWITH_TEASERPP).");
+        #endif
     } catch (const std::exception& e) {
         RCLCPP_ERROR(get_logger(), "TEASER++ registration failed: %s", e.what());
     }
     return false;
+}
+
+bool FusedLocalization::fetchLatestImage(cv::Mat& img, double& ts) {
+    std::lock_guard<std::mutex> lock(mutex_buffer_);
+    if (image_buffer_.empty()) return false;
+    auto msg = image_buffer_.back();
+    try {
+        cv_bridge::CvImagePtr cv_ptr = cv_bridge::toCvCopy(msg, sensor_msgs::image_encodings::BGR8);
+        cv::cvtColor(cv_ptr->image, img, cv::COLOR_BGR2GRAY);
+        ts = rclcpp::Time(msg->header.stamp).seconds();
+        return true;
+    } catch (const cv_bridge::Exception& e) {
+        RCLCPP_ERROR(get_logger(), "fetchLatestImage cv_bridge exception: %s", e.what());
+        return false;
+    } catch (const std::exception& e) {
+        RCLCPP_ERROR(get_logger(), "fetchLatestImage exception: %s", e.what());
+        return false;
+    }
+}
+
+bool FusedLocalization::processImageAssist(VisualResult& vr) {
+    vr = VisualResult();
+    if (!image_enable_) return false;
+
+    cv::Mat cur_gray;
+    double cur_ts = 0.0;
+    if (!fetchLatestImage(cur_gray, cur_ts)) {
+        return false;
+    }
+
+    if (!have_last_image_) {
+        last_image_gray_ = cur_gray.clone();
+        last_image_ts_ = cur_ts;
+        have_last_image_ = true;
+        return false;
+    }
+
+    // ORB 特征
+    auto orb = cv::ORB::create(1000);
+    std::vector<cv::KeyPoint> k1, k2;
+    cv::Mat d1, d2;
+    try {
+        orb->detectAndCompute(last_image_gray_, cv::noArray(), k1, d1);
+        orb->detectAndCompute(cur_gray, cv::noArray(), k2, d2);
+    } catch (const std::exception& e) {
+        RCLCPP_ERROR(get_logger(), "ORB detect/compute failed: %s", e.what());
+        last_image_gray_ = cur_gray.clone();
+        last_image_ts_ = cur_ts;
+        have_last_image_ = true;
+        return false;
+    }
+
+    if (d1.empty() || d2.empty() || k1.size() < (size_t)image_min_matches_ || k2.size() < (size_t)image_min_matches_) {
+        last_image_gray_ = cur_gray.clone();
+        last_image_ts_ = cur_ts;
+        have_last_image_ = true;
+        return false;
+    }
+
+    // 暴力匹配 + 比率测试
+    std::vector<std::vector<cv::DMatch>> knn_matches;
+    try {
+        cv::BFMatcher matcher(cv::NORM_HAMMING, false);
+        matcher.knnMatch(d1, d2, knn_matches, 2);
+    } catch (const std::exception& e) {
+        RCLCPP_ERROR(get_logger(), "BFMatcher failed: %s", e.what());
+        last_image_gray_ = cur_gray.clone();
+        last_image_ts_ = cur_ts;
+        have_last_image_ = true;
+        return false;
+    }
+
+    std::vector<cv::Point2f> pts1, pts2;
+    for (auto& m : knn_matches) {
+        if (m.size() < 2) continue;
+        if (m[0].distance < 0.75 * m[1].distance) {
+            pts1.push_back(k1[m[0].queryIdx].pt);
+            pts2.push_back(k2[m[0].trainIdx].pt);
+        }
+    }
+
+    if ((int)pts1.size() < image_min_matches_) {
+        last_image_gray_ = cur_gray.clone();
+        last_image_ts_ = cur_ts;
+        have_last_image_ = true;
+        return false;
+    }
+
+    cv::Mat K = (cv::Mat_<double>(3,3) << image_fx_, 0, image_cx_,
+                                         0, image_fy_, image_cy_,
+                                         0, 0, 1);
+    cv::Mat mask;
+    cv::Mat E;
+    try {
+        E = cv::findEssentialMat(pts1, pts2, K, cv::RANSAC, 0.999, 1.0, mask);
+    } catch (const std::exception& e) {
+        RCLCPP_ERROR(get_logger(), "findEssentialMat failed: %s", e.what());
+        last_image_gray_ = cur_gray.clone();
+        last_image_ts_ = cur_ts;
+        have_last_image_ = true;
+        return false;
+    }
+    if (E.empty()) {
+        last_image_gray_ = cur_gray.clone();
+        last_image_ts_ = cur_ts;
+        have_last_image_ = true;
+        return false;
+    }
+
+    cv::Mat R, t;
+    int inliers = 0;
+    try {
+        inliers = cv::recoverPose(E, pts1, pts2, K, R, t, mask);
+    } catch (const std::exception& e) {
+        RCLCPP_ERROR(get_logger(), "recoverPose failed: %s", e.what());
+        last_image_gray_ = cur_gray.clone();
+        last_image_ts_ = cur_ts;
+        have_last_image_ = true;
+        return false;
+    }
+
+    if (inliers < image_min_matches_) {
+        last_image_gray_ = cur_gray.clone();
+        last_image_ts_ = cur_ts;
+        have_last_image_ = true;
+        return false;
+    }
+
+    Eigen::Matrix3d R_eig;
+    for (int i = 0; i < 3; ++i) {
+        for (int j = 0; j < 3; ++j) {
+            R_eig(i,j) = R.at<double>(i,j);
+        }
+    }
+    vr.rot = Eigen::Quaterniond(R_eig);
+    vr.score = 1.0 / std::max(1, inliers);
+    vr.success = true;
+
+    last_image_gray_ = cur_gray.clone();
+    last_image_ts_ = cur_ts;
+    have_last_image_ = true;
+    return true;
 }
 
 void FusedLocalization::publish100Hz() {

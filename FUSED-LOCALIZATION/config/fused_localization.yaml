@@ -42,6 +42,13 @@ fused_localization:
     teaser_enable: false               # 启用 TEASER++ 超鲁棒初值
     teaser_max_corr_dist: 2.0          # TEASER++ 最大对应距离（米）
     teaser_noise_bound: 0.05           # TEASER++ 噪声界（米）
+    image_enable: true                 # 启用图像辅助（姿态融合）
+    image_weight: 0.3                  # 图像姿态权重 [0,1]
+    image_fx: 500.0
+    image_fy: 500.0
+    image_cx: 320.0
+    image_cy: 240.0
+    image_min_matches: 50              # 最小有效匹配点数
     
     # 点云处理
     voxel_leaf_size: 0.2    # 体素滤波尺寸（米）

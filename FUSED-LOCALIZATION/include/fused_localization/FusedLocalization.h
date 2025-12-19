@@ -26,9 +26,13 @@
 #include <pcl/kdtree/kdtree_flann.h>
 #include <pcl/filters/voxel_grid.h>
 #include <pcl/filters/statistical_outlier_removal.h>
+#include <pcl/features/normal_3d_omp.h>
+#include <pcl/features/fpfh_omp.h>
+#include <pcl/registration/ia_ransac.h>
 #include <vector>
 #include <string>
 #include <optional>
+#include <opencv2/calib3d.hpp>
 
 #include <gtsam/geometry/Pose3.h>
 #include <gtsam/geometry/Rot3.h>
@@ -121,6 +125,13 @@ struct CandidatePose {
     std::string source;
     bool valid;
     CandidatePose() : transform(Eigen::Matrix4d::Identity()), score(1e9), source("none"), valid(false) {}
+};
+
+struct VisualResult {
+    Eigen::Quaterniond rot;
+    double score;
+    bool success;
+    VisualResult() : rot(Eigen::Quaterniond::Identity()), score(1e9), success(false) {}
 };
 
 class FusedLocalization : public rclcpp::Node {
@@ -229,6 +240,10 @@ private:
     bool teaser_enable_;
     double teaser_max_corr_dist_;
     double teaser_noise_bound_;
+    bool image_enable_;
+    double image_weight_;
+    double image_fx_, image_fy_, image_cx_, image_cy_;
+    int image_min_matches_;
     
     // 点云处理
     pcl::VoxelGrid<pcl::PointXYZI> voxel_filter_;
@@ -264,6 +279,8 @@ private:
                             const pcl::PointCloud<pcl::PointXYZI>::Ptr& tgt,
                             Eigen::Matrix4d& T);
     CandidatePose refineWithNDTGICP(const Eigen::Matrix4d& init_guess);
+    bool processImageAssist(VisualResult& vr);
+    bool fetchLatestImage(cv::Mat& img, double& ts);
     
     // 后端优化（LIO-SAM风格）
     void processBackend();
@@ -293,6 +310,11 @@ private:
     
     // 参数读取
     void loadParameters();
+
+    // 图像缓存
+    cv::Mat last_image_gray_;
+    double last_image_ts_;
+    bool have_last_image_;
 };
 
 #endif // FUSED_LOCALIZATION_H
