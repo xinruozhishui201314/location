@@ -1,0 +1,48 @@
+# 融合定位系统配置文件
+
+fused_localization:
+  ros__parameters:
+    # 输出频率 (Hz)
+    output_frequency: 100.0
+    
+    # 先验地图路径
+    prior_map_path: "/path/to/prior_map.pcd"
+    
+    # 初始化选项
+    init_with_map: true      # 使用先验地图初始化
+    init_with_qr: true       # 使用二维码初始化
+    init_with_gps: true      # 使用GPS/RTK初始化
+    init_timeout: 10.0       # 初始化超时时间（秒）
+    
+    # GPS参数
+    gps_cov_threshold: 2.0   # GPS协方差阈值
+    
+    # 关键帧参数
+    max_keyframe_num: 100
+    keyframe_distance_threshold: 1.0    # 米
+    keyframe_angle_threshold: 0.2       # 弧度
+    
+    # 点云处理
+    voxel_leaf_size: 0.2    # 体素滤波尺寸（米）
+    
+    # 传感器话题
+    lidar_topic: "lidar/points"
+    imu_topic: "imu/data"
+    image_topic: "camera/image"
+    gps_topic: "gps/fix"
+    rtk_topic: "rtk/odometry"
+    
+    # 坐标系
+    map_frame: "map"
+    base_frame: "base_link"
+    lidar_frame: "laser_link"
+    camera_frame: "camera_link"
+    
+    # 外参（相机到LiDAR）
+    camera_to_lidar:
+      translation: [0.0, 0.0, 0.0]
+      rotation: [0.0, 0.0, 0.0, 1.0]  # x, y, z, w
+    
+    # 二维码数据库
+    qr_code_database_path: "/path/to/qr_codes.yaml"
+

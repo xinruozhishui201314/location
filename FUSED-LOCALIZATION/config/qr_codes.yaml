@@ -1,0 +1,22 @@
+# 二维码位置数据库
+# 格式：二维码ID -> 全局位置和姿态
+
+qr_codes:
+  - id: 0
+    position: [0.0, 0.0, 0.0]  # x, y, z (米)
+    orientation: [0.0, 0.0, 0.0, 1.0]  # x, y, z, w (四元数)
+    size: 0.1  # 二维码尺寸（米）
+    description: "充电站入口"
+  
+  - id: 1
+    position: [5.0, 0.0, 0.0]
+    orientation: [0.0, 0.0, 0.0, 1.0]
+    size: 0.1
+    description: "充电站位置1"
+  
+  - id: 2
+    position: [10.0, 0.0, 0.0]
+    orientation: [0.0, 0.0, 0.0, 1.0]
+    size: 0.1
+    description: "加水站位置1"
+
