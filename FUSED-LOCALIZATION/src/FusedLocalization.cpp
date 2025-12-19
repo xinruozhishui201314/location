@@ -9,6 +9,9 @@
 #include <tf2_geometry_msgs/tf2_geometry_msgs.hpp>
 #include <tf2_eigen/tf2_eigen.hpp>
 #include <tf2/LinearMath/Quaternion.h>
+#include <pcl/registration/gicp.h>
+#include <pcl/filters/statistical_outlier_removal.h>
+#include <algorithm>
 #include <cmath>
 #include <chrono>
 
@@ -19,6 +22,9 @@ FusedLocalization::FusedLocalization()
       prior_map_loaded_(false),
       gps_available_(false),
       rtk_available_(false),
+      lost_(false),
+      relocalization_fail_cnt_(0),
+      last_reloc_time_(0.0),
       keyframe_count_(0),
       last_gps_time_(0.0),
       init_start_time_(0.0)
@@ -118,6 +124,27 @@ void FusedLocalization::loadParameters() {
     declare_parameter("max_keyframe_num", 100);
     declare_parameter("keyframe_distance_threshold", 1.0);
     declare_parameter("keyframe_angle_threshold", 0.2);
+    declare_parameter("voxel_leaf_size", 0.2);
+
+    // 动态去除与鲁棒配准参数
+    declare_parameter("dynamic_remove_enable", true);
+    declare_parameter("sor_mean_k", 20);
+    declare_parameter("sor_std_mul", 1.0);
+    declare_parameter("icp_max_corr_dist", 1.0);
+    declare_parameter("icp_max_iterations", 50);
+    declare_parameter("icp_fitness_threshold", 0.5);
+    declare_parameter("ndt_resolution", 1.0);
+    declare_parameter("ndt_fitness_threshold", 1.0);
+    declare_parameter("gicp_fitness_threshold", 0.5);
+    declare_parameter("relocalization_fitness_threshold", 2.0);
+    declare_parameter("relocalization_min_inlier_ratio", 0.2);
+    declare_parameter("relocalization_timeout", 2.0);
+    declare_parameter("init_max_trials", 3);
+    declare_parameter("scan_context_enable", false);
+    declare_parameter("scan_context_topk", 5);
+    declare_parameter("teaser_enable", false);
+    declare_parameter("teaser_max_corr_dist", 2.0);
+    declare_parameter("teaser_noise_bound", 0.05);
     
     get_parameter("output_frequency", output_frequency_);
     get_parameter("prior_map_path", prior_map_path_);
@@ -129,8 +156,30 @@ void FusedLocalization::loadParameters() {
     get_parameter("max_keyframe_num", max_keyframe_num_);
     get_parameter("keyframe_distance_threshold", keyframe_distance_threshold_);
     get_parameter("keyframe_angle_threshold", keyframe_angle_threshold_);
+    get_parameter("voxel_leaf_size", voxel_leaf_size_);
+
+    get_parameter("dynamic_remove_enable", dynamic_remove_enable_);
+    get_parameter("sor_mean_k", sor_mean_k_);
+    get_parameter("sor_std_mul", sor_std_mul_);
+    get_parameter("icp_max_corr_dist", icp_max_corr_dist_);
+    get_parameter("icp_max_iterations", icp_max_iterations_);
+    get_parameter("icp_fitness_threshold", icp_fitness_threshold_);
+    get_parameter("ndt_resolution", ndt_resolution_);
+    get_parameter("ndt_fitness_threshold", ndt_fitness_threshold_);
+    get_parameter("gicp_fitness_threshold", gicp_fitness_threshold_);
+    get_parameter("relocalization_fitness_threshold", relocalization_fitness_threshold_);
+    get_parameter("relocalization_min_inlier_ratio", relocalization_min_inlier_ratio_);
+    get_parameter("relocalization_timeout", relocalization_timeout_);
+    get_parameter("init_max_trials", init_max_trials_);
+    get_parameter("scan_context_enable", scan_context_enable_);
+    get_parameter("scan_context_topk", scan_context_topk_);
+    get_parameter("teaser_enable", teaser_enable_);
+    get_parameter("teaser_max_corr_dist", teaser_max_corr_dist_);
+    get_parameter("teaser_noise_bound", teaser_noise_bound_);
     
-    RCLCPP_INFO(get_logger(), "Parameters loaded: output_freq=%.1f Hz", output_frequency_);
+    voxel_filter_.setLeafSize(voxel_leaf_size_, voxel_leaf_size_, voxel_leaf_size_);
+    
+    RCLCPP_INFO(get_logger(), "Parameters loaded: output_freq=%.1f Hz, voxel=%.2f", output_frequency_, voxel_leaf_size_);
 }
 
 void FusedLocalization::lidarCallback(const sensor_msgs::msg::PointCloud2::ConstPtr& msg) {
@@ -227,43 +276,87 @@ bool FusedLocalization::synchronizeData() {
     // 下采样
     voxel_filter_.setInputCloud(current_cloud_);
     voxel_filter_.filter(*current_cloud_);
+    if (current_cloud_->empty()) {
+        return false;
+    }
     
     return true;
 }
 
+void FusedLocalization::filterDynamicPoints(pcl::PointCloud<pcl::PointXYZI>::Ptr& cloud) {
+    if (!dynamic_remove_enable_ || !cloud || cloud->empty()) return;
+
+    pcl::StatisticalOutlierRemoval<pcl::PointXYZI> sor;
+    sor.setInputCloud(cloud);
+    sor.setMeanK(std::max(5, sor_mean_k_));
+    sor.setStddevMulThresh(std::max(0.1, sor_std_mul_));
+    pcl::PointCloud<pcl::PointXYZI> filtered;
+    sor.filter(filtered);
+    cloud->swap(filtered);
+}
+
 bool FusedLocalization::initializeSystem() {
-    // 优先级：RTK > GPS > 二维码 > 先验地图 > 运动初始化
+    int trials = 0;
+    double stamp = rclcpp::Clock().now().seconds();
+
+    // 1) RTK / GPS
     if (init_with_gps_ && rtk_available_ && !rtk_buffer_.empty()) {
-        return initializeWithGPS();
+        trials++;
+        if (initializeWithGPS()) return true;
     }
-    
     if (init_with_gps_ && gps_available_ && !gps_buffer_.empty()) {
-        return initializeWithGPS();
+        trials++;
+        if (initializeWithGPS()) return true;
     }
-    
+
+    // 2) 二维码
     if (init_with_qr_ && !image_buffer_.empty()) {
+        trials++;
         auto image_msg = image_buffer_.back();
         cv_bridge::CvImagePtr cv_ptr;
         try {
             cv_ptr = cv_bridge::toCvCopy(image_msg, sensor_msgs::image_encodings::BGR8);
             std::vector<QRCodeInfo> detected_qr;
             if (detectQRCode(cv_ptr->image, detected_qr) && !detected_qr.empty()) {
-                return initializeWithQRCode();
+                if (initializeWithQRCode()) return true;
             }
         } catch (cv_bridge::Exception& e) {
             RCLCPP_ERROR(get_logger(), "cv_bridge exception: %s", e.what());
         }
     }
-    
+
+    // 3) 先验地图匹配初始化
     if (init_with_map_ && prior_map_loaded_ && !current_cloud_->empty()) {
-        return initializeWithPriorMap();
+        trials++;
+        if (initializeWithPriorMap()) return true;
     }
-    
-    // 最后尝试运动初始化（需要一些运动）
-    if (lidar_buffer_.size() >= 5) {
-        return initializeWithMotion();
+
+    // 4) 多候选全局重定位（Scan Context/ISC + NDT/GICP + 可选 TEASER）
+    if (prior_map_loaded_ && !current_cloud_->empty()) {
+        trials++;
+        OdometryResult relo;
+        if (tryRelocalization(relo) && relo.success) {
+            last_transform_ = relo.transform;
+            current_state_ = transformToState(last_transform_, stamp);
+            factor_graph_.resize(0);
+            initial_estimate_.clear();
+            Pose3 init_pose(Rot3(last_transform_.block<3,3>(0,0)),
+                           Point3(last_transform_.block<3,1>(0,3)));
+            auto noise = noiseModel::Diagonal::Sigmas((Vector(6) << 0.2,0.2,0.2,0.2,0.2,0.2).finished());
+            factor_graph_.add(PriorFactor<Pose3>(X(0), init_pose, noise));
+            initial_estimate_.insert(X(0), init_pose);
+            keyframe_count_ = 1;
+            RCLCPP_INFO(get_logger(), "Relocalization-based initialization succeeded, method=%s", relo.method.c_str());
+            return true;
+        }
     }
-    
+
+    // 5) 运动初始化兜底
+    if (lidar_buffer_.size() >= 3 && trials < init_max_trials_) {
+        trials++;
+        if (initializeWithMotion()) return true;
+    }
+
     return false;
 }
 
@@ -407,53 +500,225 @@ bool FusedLocalization::initializeWithGPS() {
 }
 
 bool FusedLocalization::initializeWithMotion() {
-    // 需要至少几个关键帧才能进行运动初始化
-    // 这里简化处理
-    RCLCPP_WARN(get_logger(), "Motion initialization not fully implemented");
-    return false;
+    if (last_cloud_->empty() || current_cloud_->empty()) {
+        RCLCPP_WARN(get_logger(), "Motion initialization skipped: insufficient clouds");
+        return false;
+    }
+
+    OdometryResult odo = estimateOdometryRobust(last_cloud_, current_cloud_);
+    if (!evaluateMatch(odo)) {
+        RCLCPP_WARN(get_logger(), "Motion initialization failed: poor match");
+        return false;
+    }
+
+    last_transform_ = last_transform_ * odo.transform;
+    current_state_ = transformToState(last_transform_, rclcpp::Clock().now().seconds());
+
+    factor_graph_.resize(0);
+    initial_estimate_.clear();
+    Pose3 init_pose(Rot3(last_transform_.block<3,3>(0,0)),
+                   Point3(last_transform_.block<3,1>(0,3)));
+    auto noise = noiseModel::Diagonal::Sigmas((Vector(6) << 0.5,0.5,0.5,0.3,0.3,0.3).finished());
+    factor_graph_.add(PriorFactor<Pose3>(X(0), init_pose, noise));
+    initial_estimate_.insert(X(0), init_pose);
+    keyframe_count_ = 1;
+
+    RCLCPP_INFO(get_logger(), "Motion initialization succeeded.");
+    return true;
 }
 
 void FusedLocalization::processFrontend() {
+    // 动态点去除
+    filterDynamicPoints(current_cloud_);
+
     if (last_cloud_->empty()) {
         *last_cloud_ = *current_cloud_;
         return;
     }
     
-    // 估计里程计（类似FAST-LIVO2的直接法）
-    Eigen::Matrix4d odom_transform = estimateOdometry(last_cloud_, current_cloud_);
-    
-    // 更新状态
-    last_transform_ = last_transform_ * odom_transform;
+    // 鲁棒里程计估计（ICP/NDT/GICP 级联）
+    OdometryResult odom = estimateOdometryRobust(last_cloud_, current_cloud_);
+    bool require_reloc = needRelocalization(odom);
+
+    if (!require_reloc && evaluateMatch(odom)) {
+        last_transform_ = last_transform_ * odom.transform;
+        lost_ = false;
+    } else {
+        OdometryResult relo;
+        if (tryRelocalization(relo)) {
+            last_transform_ = relo.transform;
+            lost_ = false;
+            odom = relo;
+        } else {
+            lost_ = true;
+            RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 2000,
+                                 "Relocalization failed, keep last pose.");
+            return;
+        }
+    }
+
     current_state_ = transformToState(last_transform_, 
                                      rclcpp::Time(lidar_buffer_.back()->header.stamp).seconds());
     
     *last_cloud_ = *current_cloud_;
 }
 
-Eigen::Matrix4d FusedLocalization::estimateOdometry(
+OdometryResult FusedLocalization::estimateOdometryRobust(
     const pcl::PointCloud<pcl::PointXYZI>::Ptr& cloud1,
     const pcl::PointCloud<pcl::PointXYZI>::Ptr& cloud2) {
     
-    // 使用ICP进行粗略估计（实际应该使用FAST-LIVO2的直接法）
+    OdometryResult result;
+
+    // 1) ICP
     pcl::IterativeClosestPoint<pcl::PointXYZI, pcl::PointXYZI> icp;
     icp.setInputSource(cloud2);
     icp.setInputTarget(cloud1);
-    icp.setMaxCorrespondenceDistance(1.0);
-    icp.setMaximumIterations(50);
-    
-    pcl::PointCloud<pcl::PointXYZI> aligned;
-    icp.align(aligned);
-    
+    icp.setMaxCorrespondenceDistance(icp_max_corr_dist_);
+    icp.setMaximumIterations(icp_max_iterations_);
+    icp.setTransformationEpsilon(1e-3);
+    pcl::PointCloud<pcl::PointXYZI> icp_aligned;
+    icp.align(icp_aligned);
     if (icp.hasConverged()) {
-        Eigen::Matrix4f transform_f = icp.getFinalTransformation();
-        Eigen::Matrix4d transform = transform_f.cast<double>();
-        return transform;
+        result.transform = icp.getFinalTransformation().cast<double>();
+        result.fitness = icp.getFitnessScore(icp_max_corr_dist_);
+        result.inlier_ratio = std::max(0.0, 1.0 - result.fitness / std::max(1e-3, icp_max_corr_dist_));
+        result.method = "ICP";
+        result.success = evaluateMatch(result);
+        if (result.success) return result;
     }
-    
-    return Eigen::Matrix4d::Identity();
+
+    // 2) NDT 作为 fallback
+    pcl::NormalDistributionsTransform<pcl::PointXYZI, pcl::PointXYZI> ndt;
+    ndt.setInputSource(cloud2);
+    ndt.setInputTarget(cloud1);
+    ndt.setResolution(ndt_resolution_);
+    ndt.setMaximumIterations(50);
+    ndt.setStepSize(0.1);
+    ndt.setTransformationEpsilon(0.01);
+    pcl::PointCloud<pcl::PointXYZI> ndt_aligned;
+    ndt.align(ndt_aligned);
+    if (ndt.hasConverged()) {
+        OdometryResult ndt_res;
+        ndt_res.transform = ndt.getFinalTransformation().cast<double>();
+        ndt_res.fitness = ndt.getFitnessScore(icp_max_corr_dist_);
+        ndt_res.inlier_ratio = std::max(0.0, 1.0 - ndt_res.fitness / std::max(1e-3, ndt_fitness_threshold_));
+        ndt_res.method = "NDT";
+        ndt_res.success = ndt_res.fitness < ndt_fitness_threshold_;
+        if (ndt_res.success) return ndt_res;
+        result = ndt_res;
+    }
+
+    // 3) GICP 再次尝试
+    pcl::GeneralizedIterativeClosestPoint<pcl::PointXYZI, pcl::PointXYZI> gicp;
+    gicp.setInputSource(cloud2);
+    gicp.setInputTarget(cloud1);
+    gicp.setMaxCorrespondenceDistance(icp_max_corr_dist_);
+    gicp.setMaximumIterations(icp_max_iterations_);
+    pcl::PointCloud<pcl::PointXYZI> gicp_aligned;
+    gicp.align(gicp_aligned);
+    if (gicp.hasConverged()) {
+        OdometryResult gicp_res;
+        gicp_res.transform = gicp.getFinalTransformation().cast<double>();
+        gicp_res.fitness = gicp.getFitnessScore(icp_max_corr_dist_);
+        gicp_res.inlier_ratio = std::max(0.0, 1.0 - gicp_res.fitness / std::max(1e-3, gicp_fitness_threshold_));
+        gicp_res.method = "GICP";
+        gicp_res.success = gicp_res.fitness < gicp_fitness_threshold_;
+        if (gicp_res.success) return gicp_res;
+        result = gicp_res;
+    }
+
+    return result;
+}
+
+bool FusedLocalization::evaluateMatch(const OdometryResult& result) const {
+    if (!result.success) return false;
+    double thresh = icp_fitness_threshold_;
+    if (result.method == "NDT" || result.method == "RELOCAL_NDT") {
+        thresh = ndt_fitness_threshold_;
+    } else if (result.method == "GICP") {
+        thresh = gicp_fitness_threshold_;
+    }
+    return result.fitness < thresh && result.inlier_ratio >= 0.05;
+}
+
+bool FusedLocalization::needRelocalization(const OdometryResult& result) const {
+    if (lost_) return true;
+    if (!result.success) return true;
+    if (result.fitness > relocalization_fitness_threshold_) return true;
+    if (result.inlier_ratio < relocalization_min_inlier_ratio_) return true;
+    return false;
+}
+
+bool FusedLocalization::tryRelocalization(OdometryResult& out_result) {
+    out_result = OdometryResult();
+    if (!prior_map_loaded_ || prior_map_->empty() || current_cloud_->empty()) return false;
+
+    double now = rclcpp::Clock().now().seconds();
+    if (now - last_reloc_time_ < relocalization_timeout_) {
+        return false;
+    }
+
+    // 候选列表
+    std::vector<CandidatePose> candidates;
+
+    // 候选 1：当前 last_transform_ 为初值的 NDT/GICP 精配准
+    CandidatePose ndt_candidate = refineWithNDTGICP(last_transform_);
+    if (ndt_candidate.valid) candidates.push_back(ndt_candidate);
+
+    // 候选 2：Scan Context/ISC 检索得到的多候选
+    if (scan_context_enable_) {
+        auto sc_list = generateScanContextCandidates();
+        candidates.insert(candidates.end(), sc_list.begin(), sc_list.end());
+    }
+
+    // 候选 3：TEASER++ 超鲁棒初值（若可用）
+    if (teaser_enable_) {
+        Eigen::Matrix4d T_teaser;
+        if (registerWithTeaser(current_cloud_, prior_map_, T_teaser)) {
+            CandidatePose cp;
+            cp.transform = T_teaser;
+            cp.source = "TEASER";
+            cp.score = 0.5;
+            cp.valid = true;
+            candidates.push_back(cp);
+        }
+    }
+
+    // 对所有候选做二次精配准并评分
+    OdometryResult best;
+    best.success = false;
+    for (auto& c : candidates) {
+        if (!c.valid) continue;
+        CandidatePose refined = refineWithNDTGICP(c.transform);
+        if (!refined.valid) continue;
+        OdometryResult tmp;
+        tmp.transform = refined.transform;
+        tmp.fitness = refined.score;
+        tmp.inlier_ratio = std::max(0.0, 1.0 - tmp.fitness / std::max(1e-3, relocalization_fitness_threshold_));
+        tmp.method = "RELOCAL_" + refined.source;
+        tmp.success = tmp.fitness < relocalization_fitness_threshold_;
+        if (tmp.success && (!best.success || tmp.fitness < best.fitness)) {
+            best = tmp;
+        }
+    }
+
+    last_reloc_time_ = now;
+    if (best.success) {
+        relocalization_fail_cnt_ = 0;
+        out_result = best;
+        return true;
+    }
+    relocalization_fail_cnt_++;
+    return false;
 }
 
 void FusedLocalization::processBackend() {
+    if (lost_) {
+        RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 2000,
+                             "Backend skip because of lost state.");
+        return;
+    }
+
     // 检查是否需要添加新的关键帧
     bool add_keyframe = false;
     
@@ -700,9 +965,78 @@ bool FusedLocalization::matchWithPriorMap(
     if (ndt.hasConverged()) {
         Eigen::Matrix4f transform_f = ndt.getFinalTransformation();
         transform = transform_f.cast<double>();
-        return true;
+        double fitness = ndt.getFitnessScore(icp_max_corr_dist_);
+        return fitness < ndt_fitness_threshold_;
     }
     
+    return false;
+}
+
+std::vector<CandidatePose> FusedLocalization::generateScanContextCandidates() {
+    std::vector<CandidatePose> out;
+    if (!scan_context_enable_) return out;
+    try {
+        // 占位：若未接入真实 Scan Context，可保持空；接入后将描述子检索得到的初值放入 out
+        RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 5000,
+                             "Scan Context not implemented; returning empty candidates.");
+    } catch (const std::exception& e) {
+        RCLCPP_ERROR(get_logger(), "Scan Context candidate generation failed: %s", e.what());
+    }
+    return out;
+}
+
+CandidatePose FusedLocalization::refineWithNDTGICP(const Eigen::Matrix4d& init_guess) {
+    CandidatePose cp;
+    try {
+        pcl::NormalDistributionsTransform<pcl::PointXYZI, pcl::PointXYZI> ndt;
+        ndt.setInputSource(current_cloud_);
+        ndt.setInputTarget(prior_map_);
+        ndt.setResolution(ndt_resolution_);
+        ndt.setMaximumIterations(60);
+        ndt.setStepSize(0.1);
+        ndt.setTransformationEpsilon(0.01);
+        pcl::PointCloud<pcl::PointXYZI> aligned;
+        ndt.align(aligned, init_guess.cast<float>());
+        if (ndt.hasConverged()) {
+            cp.transform = ndt.getFinalTransformation().cast<double>();
+            cp.score = ndt.getFitnessScore(icp_max_corr_dist_);
+            cp.source = "NDT";
+            cp.valid = cp.score < relocalization_fitness_threshold_;
+            return cp;
+        }
+
+        pcl::GeneralizedIterativeClosestPoint<pcl::PointXYZI, pcl::PointXYZI> gicp;
+        gicp.setInputSource(current_cloud_);
+        gicp.setInputTarget(prior_map_);
+        gicp.setMaxCorrespondenceDistance(icp_max_corr_dist_);
+        gicp.setMaximumIterations(icp_max_iterations_);
+        pcl::PointCloud<pcl::PointXYZI> gicp_aligned;
+        gicp.align(gicp_aligned, init_guess.cast<float>());
+        if (gicp.hasConverged()) {
+            cp.transform = gicp.getFinalTransformation().cast<double>();
+            cp.score = gicp.getFitnessScore(icp_max_corr_dist_);
+            cp.source = "GICP";
+            cp.valid = cp.score < relocalization_fitness_threshold_;
+            return cp;
+        }
+    } catch (const std::exception& e) {
+        RCLCPP_ERROR(get_logger(), "Refine NDT/GICP failed: %s", e.what());
+    }
+    cp.valid = false;
+    return cp;
+}
+
+bool FusedLocalization::registerWithTeaser(const pcl::PointCloud<pcl::PointXYZI>::Ptr& src,
+                                           const pcl::PointCloud<pcl::PointXYZI>::Ptr& tgt,
+                                           Eigen::Matrix4d& T) {
+    if (!teaser_enable_) return false;
+    try {
+        // 占位：未接入 TEASER++ 时返回 false，避免编译依赖。
+        RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 5000,
+                             "TEASER++ not implemented; returning false.");
+    } catch (const std::exception& e) {
+        RCLCPP_ERROR(get_logger(), "TEASER++ registration failed: %s", e.what());
+    }
     return false;
 }
 

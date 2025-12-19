@@ -21,6 +21,27 @@ fused_localization:
     max_keyframe_num: 100
     keyframe_distance_threshold: 1.0    # 米
     keyframe_angle_threshold: 0.2       # 弧度
+    voxel_leaf_size: 0.2                # 体素滤波尺寸（米）
+    
+    # 动态去除与鲁棒配准
+    dynamic_remove_enable: true
+    sor_mean_k: 20
+    sor_std_mul: 1.0
+    icp_max_corr_dist: 1.0
+    icp_max_iterations: 50
+    icp_fitness_threshold: 0.5
+    ndt_resolution: 1.0
+    ndt_fitness_threshold: 1.0
+    gicp_fitness_threshold: 0.5
+    relocalization_fitness_threshold: 2.0
+    relocalization_min_inlier_ratio: 0.2
+    relocalization_timeout: 2.0        # 秒
+    init_max_trials: 3
+    scan_context_enable: false         # 启用 Scan Context/ISC 全局检索
+    scan_context_topk: 5               # 取前 K 个候选
+    teaser_enable: false               # 启用 TEASER++ 超鲁棒初值
+    teaser_max_corr_dist: 2.0          # TEASER++ 最大对应距离（米）
+    teaser_noise_bound: 0.05           # TEASER++ 噪声界（米）
     
     # 点云处理
     voxel_leaf_size: 0.2    # 体素滤波尺寸（米）

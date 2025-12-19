@@ -21,9 +21,14 @@
 #include <pcl/point_types.h>
 #include <pcl/io/pcd_io.h>
 #include <pcl/registration/icp.h>
+#include <pcl/registration/gicp.h>
 #include <pcl/registration/ndt.h>
 #include <pcl/kdtree/kdtree_flann.h>
 #include <pcl/filters/voxel_grid.h>
+#include <pcl/filters/statistical_outlier_removal.h>
+#include <vector>
+#include <string>
+#include <optional>
 
 #include <gtsam/geometry/Pose3.h>
 #include <gtsam/geometry/Rot3.h>
@@ -92,6 +97,30 @@ enum class InitStatus {
     INITIALIZING,
     INITIALIZED,
     INIT_FAILED
+};
+
+// 里程计结果
+struct OdometryResult {
+    Eigen::Matrix4d transform;
+    double fitness;
+    double inlier_ratio;
+    std::string method;
+    bool success;
+    OdometryResult()
+        : transform(Eigen::Matrix4d::Identity()),
+          fitness(1e9),
+          inlier_ratio(0.0),
+          method("none"),
+          success(false) {}
+};
+
+// 多候选姿态
+struct CandidatePose {
+    Eigen::Matrix4d transform;
+    double score;
+    std::string source;
+    bool valid;
+    CandidatePose() : transform(Eigen::Matrix4d::Identity()), score(1e9), source("none"), valid(false) {}
 };
 
 class FusedLocalization : public rclcpp::Node {
@@ -169,6 +198,9 @@ private:
     bool rtk_available_;
     double gps_cov_threshold_;
     double last_gps_time_;
+    bool lost_;                 // 是否处于丢失状态
+    int relocalization_fail_cnt_;
+    double last_reloc_time_;
     
     // 参数
     double output_frequency_;  // 100Hz
@@ -176,6 +208,27 @@ private:
     int max_keyframe_num_;
     double keyframe_distance_threshold_;
     double keyframe_angle_threshold_;
+    double voxel_leaf_size_;
+
+    // 动态去除与鲁棒配准参数
+    bool dynamic_remove_enable_;
+    int sor_mean_k_;
+    double sor_std_mul_;
+    double icp_max_corr_dist_;
+    int icp_max_iterations_;
+    double icp_fitness_threshold_;
+    double ndt_resolution_;
+    double ndt_fitness_threshold_;
+    double gicp_fitness_threshold_;
+    double relocalization_fitness_threshold_;
+    double relocalization_min_inlier_ratio_;
+    double relocalization_timeout_;
+    int init_max_trials_;
+    bool scan_context_enable_;
+    int scan_context_topk_;
+    bool teaser_enable_;
+    double teaser_max_corr_dist_;
+    double teaser_noise_bound_;
     
     // 点云处理
     pcl::VoxelGrid<pcl::PointXYZI> voxel_filter_;
@@ -200,8 +253,17 @@ private:
     
     // 前端处理（FAST-LIVO2风格）
     void processFrontend();
-    Eigen::Matrix4d estimateOdometry(const pcl::PointCloud<pcl::PointXYZI>::Ptr& cloud1,
-                                     const pcl::PointCloud<pcl::PointXYZI>::Ptr& cloud2);
+    void filterDynamicPoints(pcl::PointCloud<pcl::PointXYZI>::Ptr& cloud);
+    OdometryResult estimateOdometryRobust(const pcl::PointCloud<pcl::PointXYZI>::Ptr& cloud1,
+                                          const pcl::PointCloud<pcl::PointXYZI>::Ptr& cloud2);
+    bool evaluateMatch(const OdometryResult& result) const;
+    bool needRelocalization(const OdometryResult& result) const;
+    bool tryRelocalization(OdometryResult& out_result);
+    std::vector<CandidatePose> generateScanContextCandidates();
+    bool registerWithTeaser(const pcl::PointCloud<pcl::PointXYZI>::Ptr& src,
+                            const pcl::PointCloud<pcl::PointXYZI>::Ptr& tgt,
+                            Eigen::Matrix4d& T);
+    CandidatePose refineWithNDTGICP(const Eigen::Matrix4d& init_guess);
     
     // 后端优化（LIO-SAM风格）
     void processBackend();
